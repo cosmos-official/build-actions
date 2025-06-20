@@ -65,4 +65,4 @@ jobs:
             exit 1
           fi
           echo "Uploading jar file: $JAR_FILE";
-          aws s3 cp --no-progress --checksum-algorithm CRC32 "$JAR_FILE" "s3://${R2_BUCKET}/${{ github.event.inputs.sha }}";
+          aws s3 cp --no-progress --checksum-algorithm CRC32 "$JAR_FILE" "s3://${{ secrets.R2_BUCKET }}/${{ github.event.inputs.sha }}";
