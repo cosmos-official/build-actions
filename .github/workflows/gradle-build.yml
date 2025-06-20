@@ -40,7 +40,7 @@ jobs:
       - name: Build with Gradle
         run: |
           chmod +x ./gradlew
-          ./gradlew build ${{ github.event.inputs.gradle_arguments }}
+          ./gradlew build -q ${{ github.event.inputs.gradle_arguments }}
 
       - name: Configure Credentials for R2
         run: |
