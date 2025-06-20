@@ -1,0 +1,68 @@
+name: Gradle Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      repository: 
+        description: 'repository to build'
+        required: true
+      sha: 
+        description: 'sha to build'
+        required: true
+      gradle_arguments:
+        description: 'arguments to pass to gradle'
+        required: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - name: Get Github Token
+        uses: actions/create-github-app-token@v2
+        id: github_app_token
+        with:
+          app-id: ${{ vars._GITHUB_APP_ID }}
+          private-key: ${{ secrets._GITHUB_APP_PEM }}
+          owner: ${{ github.repository_owner }}
+
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          repository: cosmos-official/${{ github.event.inputs.repository }}
+          ref: ${{ github.event.inputs.sha }}
+          token: ${{ steps.github_app_token.outputs.token }}
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          cache-encryption-key: ${{ secrets.GRADLE_ENCRYPTION_KEY }}
+
+      - name: Build with Gradle
+        run: |
+          chmod +x ./gradlew
+          ./gradlew build ${{ github.event.inputs.gradle_arguments }}
+
+      - name: Configure Credentials for R2
+        run: |
+          mkdir -p ~/.aws
+          cat > ~/.aws/credentials << EOF
+          [default]
+          aws_access_key_id=${{ secrets.R2_ACCESS_KEY_ID }}
+          aws_secret_access_key=${{ secrets.R2_SECRET_ACCESS_KEY }}
+          EOF
+
+          cat > ~/.aws/config << EOF
+          [default]
+          region=auto
+          endpoint_url=${{ secrets.R2_ENDPOINT }}
+          EOF
+
+      - name: Upload to R2
+        run: |
+          JAR_FILE=$(find ./build/libs -name "*.jar" -type f | head -n 1);
+          if [ -z "$JAR_FILE" ]; then
+            echo "No jar file found!"
+            exit 1
+          fi
+          echo "Uploading jar file: $JAR_FILE";
+          aws s3 cp --no-progress --checksum-algorithm CRC32 "$JAR_FILE" "s3://${R2_BUCKET}/${{ github.event.inputs.sha }}";
