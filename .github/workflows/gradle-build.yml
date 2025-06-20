@@ -1,4 +1,5 @@
 name: Gradle Build
+run-name: "${{ github.event.inputs.repository }}/${{ github.event.inputs.sha }}"
 
 on:
   workflow_dispatch:
