@@ -191,7 +191,7 @@ jobs:
             | skopeo login --authfile "$REGISTRY_AUTH_FILE" \
                 --username "$GH_USERNAME" --password-stdin ghcr.io
 
-      - name: Publish GHCR latest and remove previous versions
+      - name: Publish GHCR version and latest and remove previous versions
         env:
           GH_TOKEN: ${{ github.token }}
           IMAGE_DIGEST: ${{ steps.image.outputs.digest }}
@@ -201,7 +201,8 @@ jobs:
           set -euo pipefail
           python3 build-actions/scripts/publish_ghcr_latest.py \
             --source-image "$ECR_IMAGE@$IMAGE_DIGEST" \
-            --destination-image "$GHCR_IMAGE:latest"
+            --destination-image "$GHCR_IMAGE:latest" \
+            --version-tag "$IMAGE_TAG"
 
       - name: Remove registry credentials
         if: always()
