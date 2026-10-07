@@ -1,0 +1,211 @@
+name: Jib Image Build
+run-name: "Jib Image Build #${{ github.run_number }}"
+
+# Repository secrets: SOURCE_REPOSITORY (name without owner), ECR_IMAGE and
+# GHCR_IMAGE (without tag or digest), AWS_ACCOUNT_ID, AWS_ACCESS_KEY_ID,
+# AWS_SECRET_ACCESS_KEY, _GITHUB_APP_PEM, GRADLE_ENCRYPTION_KEY.
+
+on:
+  workflow_dispatch:
+    inputs:
+      repository:
+        description: Repository to build (must match the configured secret)
+        required: true
+        type: string
+      sha:
+        description: Full commit SHA to build
+        required: true
+        type: string
+      tag:
+        description: Existing SemVer tag for the commit
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: jib-image-build
+  queue: max
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      SOURCE_REPOSITORY: ${{ secrets.SOURCE_REPOSITORY }}
+      SOURCE_SHA: ${{ inputs.sha }}
+      IMAGE_TAG: ${{ inputs.tag }}
+      AWS_REGION: ap-northeast-2
+      AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
+      ECR_IMAGE: ${{ secrets.ECR_IMAGE }}
+      GHCR_IMAGE: ${{ secrets.GHCR_IMAGE }}
+    steps:
+      - name: Validate build inputs
+        env:
+          REQUESTED_REPOSITORY: ${{ inputs.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          for SECRET_NAME in SOURCE_REPOSITORY AWS_ACCOUNT_ID ECR_IMAGE GHCR_IMAGE; do
+            if [[ -z "${!SECRET_NAME}" ]]; then
+              echo "::error::Missing required secret: $SECRET_NAME"
+              exit 1
+            fi
+          done
+          if [[ ! "$SOURCE_REPOSITORY" =~ ^[A-Za-z0-9_.-]+$ ]]; then
+            echo "::error::SOURCE_REPOSITORY must be a repository name without an owner"
+            exit 1
+          fi
+          if [[ ! "$AWS_ACCOUNT_ID" =~ ^[0-9]{12}$ ]]; then
+            echo "::error::AWS_ACCOUNT_ID must contain exactly 12 digits"
+            exit 1
+          fi
+          if [[ "$ECR_IMAGE" != "$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/"* \
+              || ! "$ECR_IMAGE" =~ ^[0-9]{12}\.dkr\.ecr\.[a-z0-9-]+\.amazonaws\.com/[a-z0-9][a-z0-9._/-]*$ ]]; then
+            echo "::error::ECR_IMAGE must be an untagged image in the configured AWS account and region"
+            exit 1
+          fi
+          if [[ "$GHCR_IMAGE" != "ghcr.io/$GITHUB_REPOSITORY_OWNER/"* \
+              || ! "$GHCR_IMAGE" =~ ^ghcr\.io/[a-z0-9-]+/[a-z0-9][a-z0-9._-]*$ ]]; then
+            echo "::error::GHCR_IMAGE must be an untagged image owned by this repository's organization"
+            exit 1
+          fi
+
+          # Secrets mask complete values; also mask fragments printed by registry tools.
+          printf '::add-mask::%s\n' "${ECR_IMAGE%%/*}" "${ECR_IMAGE#*/}" "${GHCR_IMAGE##*/}"
+
+          if [[ "$REQUESTED_REPOSITORY" != "$SOURCE_REPOSITORY" ]]; then
+            echo "::error::The requested repository does not match the configured build target"
+            exit 1
+          fi
+          if [[ ! "$SOURCE_SHA" =~ ^[a-f0-9]{40}$ ]]; then
+            echo "::error::A full lowercase commit SHA is required"
+            exit 1
+          fi
+          if [[ ! "$IMAGE_TAG" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::An existing SemVer tag is required"
+            exit 1
+          fi
+
+      - name: Checkout build workflow scripts
+        uses: actions/checkout@v4
+        with:
+          path: build-actions
+          persist-credentials: false
+
+      - name: Get source repository token
+        uses: actions/create-github-app-token@v2
+        id: source_token
+        with:
+          app-id: ${{ vars._GITHUB_APP_ID }}
+          private-key: ${{ secrets._GITHUB_APP_PEM }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ secrets.SOURCE_REPOSITORY }}
+          permission-contents: read
+
+      - name: Checkout source commit and tags
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/${{ secrets.SOURCE_REPOSITORY }}
+          ref: ${{ inputs.sha }}
+          token: ${{ steps.source_token.outputs.token }}
+          fetch-depth: 0
+          persist-credentials: false
+          path: source
+
+      - name: Verify source tag
+        working-directory: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$(git rev-parse HEAD)" != "$SOURCE_SHA" ]]; then
+            echo "::error::Checkout does not match the requested commit"
+            exit 1
+          fi
+          if [[ "$(git rev-parse "refs/tags/$IMAGE_TAG^{commit}")" != "$SOURCE_SHA" ]]; then
+            echo "::error::The version tag does not point to the requested commit"
+            exit 1
+          fi
+
+      - name: Set up JDK 25
+        uses: actions/setup-java@v4
+        with:
+          java-version: '25'
+          distribution: corretto
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          cache-encryption-key: ${{ secrets.GRADLE_ENCRYPTION_KEY }}
+
+      - name: Configure ECR credentials
+        uses: aws-actions/configure-aws-credentials@v6.3.0
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+          allowed-account-ids: ${{ secrets.AWS_ACCOUNT_ID }}
+          mask-aws-account-id: true
+
+      - name: Build and publish ECR image
+        id: image
+        working-directory: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x ./gradlew
+          ./gradlew jib --console=plain "-Djib.to.image=$ECR_IMAGE" "-Djib.to.tags=$IMAGE_TAG,latest"
+          DIGEST=$(cat build/jib-image.digest)
+          if [[ ! "$DIGEST" =~ ^sha256:[a-f0-9]{64}$ ]]; then
+            echo "::error::Jib did not produce a valid image digest"
+            exit 1
+          fi
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+          # Markdown backticks are literal code spans.
+          # shellcheck disable=SC2016
+          printf '### Container image\n\n- Version: `%s`\n- Commit: `%s`\n- ECR digest: `%s`\n' \
+            "$IMAGE_TAG" "$SOURCE_SHA" "$DIGEST" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Install Skopeo
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends skopeo
+
+      - name: Authenticate image registries
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_USERNAME: ${{ github.actor }}
+          REGISTRY_AUTH_FILE: ${{ runner.temp }}/jib-registry-auth.json
+        shell: bash
+        run: |
+          set -euo pipefail
+          aws ecr get-login-password --region "$AWS_REGION" \
+            | skopeo login --authfile "$REGISTRY_AUTH_FILE" \
+                --username AWS --password-stdin "${ECR_IMAGE%%/*}"
+          printf '%s' "$GH_TOKEN" \
+            | skopeo login --authfile "$REGISTRY_AUTH_FILE" \
+                --username "$GH_USERNAME" --password-stdin ghcr.io
+
+      - name: Publish GHCR latest and remove previous versions
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IMAGE_DIGEST: ${{ steps.image.outputs.digest }}
+          REGISTRY_AUTH_FILE: ${{ runner.temp }}/jib-registry-auth.json
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 build-actions/scripts/publish_ghcr_latest.py \
+            --source-image "$ECR_IMAGE@$IMAGE_DIGEST" \
+            --destination-image "$GHCR_IMAGE:latest"
+
+      - name: Remove registry credentials
+        if: always()
+        env:
+          REGISTRY_AUTH_FILE: ${{ runner.temp }}/jib-registry-auth.json
+        shell: bash
+        run: rm -f "$REGISTRY_AUTH_FILE"
