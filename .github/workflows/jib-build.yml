@@ -25,24 +25,25 @@ permissions:
   contents: read
   packages: write
 
-concurrency:
-  group: jib-image-build
-  queue: max
-  cancel-in-progress: false
+env:
+  SOURCE_SHA: ${{ inputs.sha }}
+  IMAGE_TAG: ${{ inputs.tag }}
+  AWS_REGION: ap-northeast-2
+  AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
+  ECR_IMAGE: ${{ secrets.ECR_IMAGE }}
+  GHCR_IMAGE: ${{ secrets.GHCR_IMAGE }}
 
 jobs:
   build:
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    permissions:
+      contents: read
+    outputs:
+      digest: ${{ steps.image.outputs.digest }}
     env:
       SOURCE_REPOSITORY: ${{ secrets.SOURCE_REPOSITORY }}
-      SOURCE_SHA: ${{ inputs.sha }}
-      IMAGE_TAG: ${{ inputs.tag }}
-      AWS_REGION: ap-northeast-2
-      AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
-      ECR_IMAGE: ${{ secrets.ECR_IMAGE }}
-      GHCR_IMAGE: ${{ secrets.GHCR_IMAGE }}
     steps:
       - name: Validate build inputs
         env:
@@ -91,12 +92,6 @@ jobs:
             echo "::error::An existing SemVer tag is required"
             exit 1
           fi
-
-      - name: Checkout build workflow scripts
-        uses: actions/checkout@v4
-        with:
-          path: build-actions
-          persist-credentials: false
 
       - name: Get source repository token
         uses: actions/create-github-app-token@v2
@@ -152,14 +147,14 @@ jobs:
           allowed-account-ids: ${{ secrets.AWS_ACCOUNT_ID }}
           mask-aws-account-id: true
 
-      - name: Build and publish ECR image
+      - name: Build and publish ECR version
         id: image
         working-directory: source
         shell: bash
         run: |
           set -euo pipefail
           chmod +x ./gradlew
-          ./gradlew jib --console=plain "-Djib.to.image=$ECR_IMAGE" "-Djib.to.tags=$IMAGE_TAG,latest"
+          ./gradlew jib --console=plain "-Djib.to.image=$ECR_IMAGE:$IMAGE_TAG" "-Djib.to.tags=$IMAGE_TAG"
           DIGEST=$(cat build/jib-image.digest)
           if [[ ! "$DIGEST" =~ ^sha256:[a-f0-9]{64}$ ]]; then
             echo "::error::Jib did not produce a valid image digest"
@@ -170,6 +165,42 @@ jobs:
           # shellcheck disable=SC2016
           printf '### Container image\n\n- Version: `%s`\n- Commit: `%s`\n- ECR digest: `%s`\n' \
             "$IMAGE_TAG" "$SOURCE_SHA" "$DIGEST" >> "$GITHUB_STEP_SUMMARY"
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    concurrency:
+      group: jib-image-publish
+      queue: max
+      cancel-in-progress: false
+    env:
+      IMAGE_DIGEST: ${{ needs.build.outputs.digest }}
+    steps:
+      - name: Validate publish digest and mask registry fragments
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "$IMAGE_DIGEST" =~ ^sha256:[a-f0-9]{64}$ ]]; then
+            echo "::error::The build did not produce a valid image digest"
+            exit 1
+          fi
+          printf '::add-mask::%s\n' "${ECR_IMAGE%%/*}" "${ECR_IMAGE#*/}" "${GHCR_IMAGE##*/}"
+
+      - name: Checkout build workflow scripts
+        uses: actions/checkout@v4
+        with:
+          path: build-actions
+          persist-credentials: false
+
+      - name: Configure ECR credentials
+        uses: aws-actions/configure-aws-credentials@v6.3.0
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+          allowed-account-ids: ${{ secrets.AWS_ACCOUNT_ID }}
+          mask-aws-account-id: true
 
       - name: Install Skopeo
         run: |
@@ -191,10 +222,18 @@ jobs:
             | skopeo login --authfile "$REGISTRY_AUTH_FILE" \
                 --username "$GH_USERNAME" --password-stdin ghcr.io
 
+      - name: Publish ECR latest
+        env:
+          REGISTRY_AUTH_FILE: ${{ runner.temp }}/jib-registry-auth.json
+        shell: bash
+        run: |
+          set -euo pipefail
+          skopeo copy --all --preserve-digests --retry-times 3 \
+            "docker://$ECR_IMAGE@$IMAGE_DIGEST" "docker://$ECR_IMAGE:latest"
+
       - name: Publish GHCR version and latest and remove previous versions
         env:
           GH_TOKEN: ${{ github.token }}
-          IMAGE_DIGEST: ${{ steps.image.outputs.digest }}
           REGISTRY_AUTH_FILE: ${{ runner.temp }}/jib-registry-auth.json
         shell: bash
         run: |
