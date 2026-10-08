@@ -1,8 +1,8 @@
 name: Jib Image Build
 run-name: "Jib Image Build #${{ github.run_number }}"
 
-# Repository secrets: SOURCE_REPOSITORY (name without owner), ECR_IMAGE and
-# GHCR_IMAGE (without tag or digest), AWS_ACCOUNT_ID, AWS_ACCESS_KEY_ID,
+# Repository secrets: SOURCE_REPOSITORY (name without owner), ECR_IMAGE
+# (without tag or digest), AWS_ACCOUNT_ID, AWS_ACCESS_KEY_ID,
 # AWS_SECRET_ACCESS_KEY, _GITHUB_APP_PEM, GRADLE_ENCRYPTION_KEY.
 
 on:
@@ -23,7 +23,6 @@ on:
 
 permissions:
   contents: read
-  packages: write
 
 env:
   SOURCE_SHA: ${{ inputs.sha }}
@@ -31,17 +30,12 @@ env:
   AWS_REGION: ap-northeast-2
   AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
   ECR_IMAGE: ${{ secrets.ECR_IMAGE }}
-  GHCR_IMAGE: ${{ secrets.GHCR_IMAGE }}
 
 jobs:
   build:
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
-    permissions:
-      contents: read
-    outputs:
-      digest: ${{ steps.image.outputs.digest }}
     env:
       SOURCE_REPOSITORY: ${{ secrets.SOURCE_REPOSITORY }}
     steps:
@@ -52,7 +46,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          for SECRET_NAME in SOURCE_REPOSITORY AWS_ACCOUNT_ID ECR_IMAGE GHCR_IMAGE; do
+          for SECRET_NAME in SOURCE_REPOSITORY AWS_ACCOUNT_ID ECR_IMAGE; do
             if [[ -z "${!SECRET_NAME}" ]]; then
               echo "::error::Missing required secret: $SECRET_NAME"
               exit 1
@@ -71,14 +65,8 @@ jobs:
             echo "::error::ECR_IMAGE must be an untagged image in the configured AWS account and region"
             exit 1
           fi
-          if [[ "$GHCR_IMAGE" != "ghcr.io/$GITHUB_REPOSITORY_OWNER/"* \
-              || ! "$GHCR_IMAGE" =~ ^ghcr\.io/[a-z0-9-]+/[a-z0-9][a-z0-9._-]*$ ]]; then
-            echo "::error::GHCR_IMAGE must be an untagged image owned by this repository's organization"
-            exit 1
-          fi
-
           # Secrets mask complete values; also mask fragments printed by registry tools.
-          printf '::add-mask::%s\n' "${ECR_IMAGE%%/*}" "${ECR_IMAGE#*/}" "${GHCR_IMAGE##*/}"
+          printf '::add-mask::%s\n' "${ECR_IMAGE%%/*}" "${ECR_IMAGE#*/}"
 
           if [[ "$REQUESTED_REPOSITORY" != "$SOURCE_REPOSITORY" ]]; then
             echo "::error::The requested repository does not match the configured build target"
@@ -148,7 +136,6 @@ jobs:
           mask-aws-account-id: true
 
       - name: Build and publish ECR version
-        id: image
         working-directory: source
         shell: bash
         run: |
@@ -160,92 +147,7 @@ jobs:
             echo "::error::Jib did not produce a valid image digest"
             exit 1
           fi
-          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
           # Markdown backticks are literal code spans.
           # shellcheck disable=SC2016
           printf '### Container image\n\n- Version: `%s`\n- Commit: `%s`\n- ECR digest: `%s`\n' \
             "$IMAGE_TAG" "$SOURCE_SHA" "$DIGEST" >> "$GITHUB_STEP_SUMMARY"
-
-  publish:
-    needs: build
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    concurrency:
-      group: jib-image-publish
-      queue: max
-      cancel-in-progress: false
-    env:
-      IMAGE_DIGEST: ${{ needs.build.outputs.digest }}
-    steps:
-      - name: Validate publish digest and mask registry fragments
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [[ ! "$IMAGE_DIGEST" =~ ^sha256:[a-f0-9]{64}$ ]]; then
-            echo "::error::The build did not produce a valid image digest"
-            exit 1
-          fi
-          printf '::add-mask::%s\n' "${ECR_IMAGE%%/*}" "${ECR_IMAGE#*/}" "${GHCR_IMAGE##*/}"
-
-      - name: Checkout build workflow scripts
-        uses: actions/checkout@v4
-        with:
-          path: build-actions
-          persist-credentials: false
-
-      - name: Configure ECR credentials
-        uses: aws-actions/configure-aws-credentials@v6.3.0
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ env.AWS_REGION }}
-          allowed-account-ids: ${{ secrets.AWS_ACCOUNT_ID }}
-          mask-aws-account-id: true
-
-      - name: Install Skopeo
-        run: |
-          sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends skopeo
-
-      - name: Authenticate image registries
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GH_USERNAME: ${{ github.actor }}
-          REGISTRY_AUTH_FILE: ${{ runner.temp }}/jib-registry-auth.json
-        shell: bash
-        run: |
-          set -euo pipefail
-          aws ecr get-login-password --region "$AWS_REGION" \
-            | skopeo login --authfile "$REGISTRY_AUTH_FILE" \
-                --username AWS --password-stdin "${ECR_IMAGE%%/*}"
-          printf '%s' "$GH_TOKEN" \
-            | skopeo login --authfile "$REGISTRY_AUTH_FILE" \
-                --username "$GH_USERNAME" --password-stdin ghcr.io
-
-      - name: Publish ECR latest
-        env:
-          REGISTRY_AUTH_FILE: ${{ runner.temp }}/jib-registry-auth.json
-        shell: bash
-        run: |
-          set -euo pipefail
-          skopeo copy --all --preserve-digests --retry-times 3 \
-            "docker://$ECR_IMAGE@$IMAGE_DIGEST" "docker://$ECR_IMAGE:latest"
-
-      - name: Publish GHCR version and latest and remove previous versions
-        env:
-          GH_TOKEN: ${{ github.token }}
-          REGISTRY_AUTH_FILE: ${{ runner.temp }}/jib-registry-auth.json
-        shell: bash
-        run: |
-          set -euo pipefail
-          python3 build-actions/scripts/publish_ghcr_latest.py \
-            --source-image "$ECR_IMAGE@$IMAGE_DIGEST" \
-            --destination-image "$GHCR_IMAGE:latest" \
-            --version-tag "$IMAGE_TAG"
-
-      - name: Remove registry credentials
-        if: always()
-        env:
-          REGISTRY_AUTH_FILE: ${{ runner.temp }}/jib-registry-auth.json
-        shell: bash
-        run: rm -f "$REGISTRY_AUTH_FILE"
