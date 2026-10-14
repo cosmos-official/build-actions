@@ -1,6 +1,12 @@
 name: Gradle Build
 run-name: "${{ github.event.inputs.repository }}/${{ github.event.inputs.sha }}"
 
+permissions:
+  contents: read
+
+env:
+  AWS_REGION: ap-northeast-2
+
 on:
   workflow_dispatch:
     inputs:
@@ -43,22 +49,16 @@ jobs:
           chmod +x ./gradlew
           ./gradlew build -q ${{ github.event.inputs.gradle_arguments }}
 
-      - name: Configure Credentials for R2
-        run: |
-          mkdir -p ~/.aws
-          cat > ~/.aws/credentials << EOF
-          [default]
-          aws_access_key_id=${{ secrets.R2_ACCESS_KEY_ID }}
-          aws_secret_access_key=${{ secrets.R2_SECRET_ACCESS_KEY }}
-          EOF
+      - name: Configure S3 credentials
+        uses: aws-actions/configure-aws-credentials@v6.3.0
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+          allowed-account-ids: ${{ secrets.AWS_ACCOUNT_ID }}
+          mask-aws-account-id: true
 
-          cat > ~/.aws/config << EOF
-          [default]
-          region=auto
-          endpoint_url=${{ secrets.R2_ENDPOINT }}
-          EOF
-
-      - name: Upload to R2
+      - name: Upload to S3
         run: |
           JAR_FILE=$(find ./build/libs -name "*.jar" -type f | grep -E "(all|fat|executable)" | head -n 1);
           if [ -z "$JAR_FILE" ]; then
@@ -71,4 +71,4 @@ jobs:
             exit 1
           fi
           echo "Uploading jar file: $JAR_FILE";
-          aws s3 cp --no-progress --checksum-algorithm CRC32 "$JAR_FILE" "s3://${{ secrets.R2_BUCKET }}/${{ github.event.inputs.repository }}/${{ github.event.inputs.sha }}";
+          aws s3 cp --no-progress --checksum-algorithm CRC32 "$JAR_FILE" "s3://vingle-application-builds/${{ github.event.inputs.repository }}/${{ github.event.inputs.sha }}";
