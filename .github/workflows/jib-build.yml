@@ -1,5 +1,5 @@
 name: Jib Image Build
-run-name: "Jib Image Build #${{ github.run_number }}"
+run-name: "Jib Image Build: ${{ inputs.module }} ${{ inputs.tag }} #${{ github.run_number }}"
 
 # Repository secrets: SOURCE_REPOSITORY (name without owner),
 # ECR_REPOSITORY_PREFIX (registry and namespace, without module, tag or digest),
