@@ -1,8 +1,9 @@
 name: Jib Image Build
 run-name: "Jib Image Build #${{ github.run_number }}"
 
-# Repository secrets: SOURCE_REPOSITORY (name without owner), ECR_IMAGE
-# (without tag or digest), AWS_ACCOUNT_ID, AWS_ACCESS_KEY_ID,
+# Repository secrets: SOURCE_REPOSITORY (name without owner),
+# ECR_REPOSITORY_PREFIX (registry and namespace, without module, tag or digest),
+# AWS_ACCOUNT_ID, AWS_ACCESS_KEY_ID,
 # AWS_SECRET_ACCESS_KEY, _GITHUB_APP_PEM, GRADLE_ENCRYPTION_KEY.
 
 on:
@@ -10,6 +11,10 @@ on:
     inputs:
       repository:
         description: Repository to build (must match the configured secret)
+        required: true
+        type: string
+      module:
+        description: Top-level Gradle module to build
         required: true
         type: string
       sha:
@@ -25,11 +30,12 @@ permissions:
   contents: read
 
 env:
+  MODULE: ${{ inputs.module }}
   SOURCE_SHA: ${{ inputs.sha }}
   IMAGE_TAG: ${{ inputs.tag }}
   AWS_REGION: ap-northeast-2
   AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
-  ECR_IMAGE: ${{ secrets.ECR_IMAGE }}
+  ECR_REPOSITORY_PREFIX: ${{ secrets.ECR_REPOSITORY_PREFIX }}
 
 jobs:
   build:
@@ -46,7 +52,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          for SECRET_NAME in SOURCE_REPOSITORY AWS_ACCOUNT_ID ECR_IMAGE; do
+          for SECRET_NAME in SOURCE_REPOSITORY AWS_ACCOUNT_ID ECR_REPOSITORY_PREFIX; do
             if [[ -z "${!SECRET_NAME}" ]]; then
               echo "::error::Missing required secret: $SECRET_NAME"
               exit 1
@@ -60,13 +66,16 @@ jobs:
             echo "::error::AWS_ACCOUNT_ID must contain exactly 12 digits"
             exit 1
           fi
+          if [[ ! "$MODULE" =~ ^[a-z0-9][a-z0-9._-]*$ ]]; then
+            echo "::error::Module must be a top-level name starting with a lowercase letter or digit and containing only lowercase letters, digits, dots, underscores or hyphens"
+            exit 1
+          fi
+          ECR_IMAGE="$ECR_REPOSITORY_PREFIX/$MODULE"
           if [[ "$ECR_IMAGE" != "$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/"* \
               || ! "$ECR_IMAGE" =~ ^[0-9]{12}\.dkr\.ecr\.[a-z0-9-]+\.amazonaws\.com/[a-z0-9][a-z0-9._/-]*$ ]]; then
             echo "::error::ECR_IMAGE must be an untagged image in the configured AWS account and region"
             exit 1
           fi
-          # Secrets mask complete values; also mask fragments printed by registry tools.
-          printf '::add-mask::%s\n' "${ECR_IMAGE%%/*}" "${ECR_IMAGE#*/}"
 
           if [[ "$REQUESTED_REPOSITORY" != "$SOURCE_REPOSITORY" ]]; then
             echo "::error::The requested repository does not match the configured build target"
@@ -80,6 +89,7 @@ jobs:
             echo "::error::An existing SemVer tag is required"
             exit 1
           fi
+          printf 'ECR_IMAGE=%s\n' "$ECR_IMAGE" >> "$GITHUB_ENV"
 
       - name: Get source repository token
         uses: actions/create-github-app-token@v2
@@ -141,13 +151,13 @@ jobs:
         run: |
           set -euo pipefail
           chmod +x ./gradlew
-          ./gradlew :core:jib --console=plain "-Djib.to.image=$ECR_IMAGE:$IMAGE_TAG" "-Djib.to.tags=$IMAGE_TAG"
-          DIGEST=$(cat core/build/jib-image.digest)
+          ./gradlew ":$MODULE:jib" --console=plain "-Djib.to.image=$ECR_IMAGE:$IMAGE_TAG" "-Djib.to.tags=$IMAGE_TAG"
+          DIGEST=$(cat "$MODULE/build/jib-image.digest")
           if [[ ! "$DIGEST" =~ ^sha256:[a-f0-9]{64}$ ]]; then
             echo "::error::Jib did not produce a valid image digest"
             exit 1
           fi
           # Markdown backticks are literal code spans.
           # shellcheck disable=SC2016
-          printf '### Container image\n\n- Version: `%s`\n- Commit: `%s`\n- ECR digest: `%s`\n' \
-            "$IMAGE_TAG" "$SOURCE_SHA" "$DIGEST" >> "$GITHUB_STEP_SUMMARY"
+          printf '### Container image\n\n- Module: `%s`\n- ECR image: `%s:%s`\n- Commit: `%s`\n- ECR digest: `%s`\n' \
+            "$MODULE" "$ECR_IMAGE" "$IMAGE_TAG" "$SOURCE_SHA" "$DIGEST" >> "$GITHUB_STEP_SUMMARY"
