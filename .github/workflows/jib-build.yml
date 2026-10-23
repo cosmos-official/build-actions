@@ -141,8 +141,8 @@ jobs:
         run: |
           set -euo pipefail
           chmod +x ./gradlew
-          ./gradlew jib --console=plain "-Djib.to.image=$ECR_IMAGE:$IMAGE_TAG" "-Djib.to.tags=$IMAGE_TAG"
-          DIGEST=$(cat build/jib-image.digest)
+          ./gradlew :core:jib --console=plain "-Djib.to.image=$ECR_IMAGE:$IMAGE_TAG" "-Djib.to.tags=$IMAGE_TAG"
+          DIGEST=$(cat core/build/jib-image.digest)
           if [[ ! "$DIGEST" =~ ^sha256:[a-f0-9]{64}$ ]]; then
             echo "::error::Jib did not produce a valid image digest"
             exit 1
