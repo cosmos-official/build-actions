@@ -1,0 +1,179 @@
+name: Docker Image Build
+run-name: "Docker Image Build: ${{ inputs.module }} ${{ inputs.tag }} #${{ github.run_number }}"
+
+# Builds the Dockerfile at the root of the source repository and pushes a
+# multi-platform (linux/arm64, linux/amd64) image to ECR.
+#
+# Repository secrets: DOCKER_SOURCE_REPOSITORY (name without owner),
+# ECR_REPOSITORY_PREFIX (registry and namespace, without module, tag or digest),
+# AWS_ACCOUNT_ID, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, _GITHUB_APP_PEM.
+# Repository variable: _GITHUB_APP_ID.
+
+on:
+  workflow_dispatch:
+    inputs:
+      repository:
+        description: Repository to build (must match the configured secret)
+        required: true
+        type: string
+      module:
+        description: Image name under the ECR namespace
+        required: true
+        type: string
+      sha:
+        description: Full commit SHA to build
+        required: true
+        type: string
+      tag:
+        description: Existing SemVer tag for the commit
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  MODULE: ${{ inputs.module }}
+  SOURCE_SHA: ${{ inputs.sha }}
+  IMAGE_TAG: ${{ inputs.tag }}
+  AWS_REGION: ap-northeast-2
+  AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
+  ECR_REPOSITORY_PREFIX: ${{ secrets.ECR_REPOSITORY_PREFIX }}
+
+jobs:
+  build:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      SOURCE_REPOSITORY: ${{ secrets.DOCKER_SOURCE_REPOSITORY }}
+    steps:
+      - name: Validate build inputs
+        env:
+          REQUESTED_REPOSITORY: ${{ inputs.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          for SECRET_NAME in SOURCE_REPOSITORY AWS_ACCOUNT_ID ECR_REPOSITORY_PREFIX; do
+            if [[ -z "${!SECRET_NAME}" ]]; then
+              echo "::error::Missing required secret: $SECRET_NAME"
+              exit 1
+            fi
+          done
+          if [[ ! "$SOURCE_REPOSITORY" =~ ^[A-Za-z0-9_.-]+$ ]]; then
+            echo "::error::DOCKER_SOURCE_REPOSITORY must be a repository name without an owner"
+            exit 1
+          fi
+          if [[ ! "$AWS_ACCOUNT_ID" =~ ^[0-9]{12}$ ]]; then
+            echo "::error::AWS_ACCOUNT_ID must contain exactly 12 digits"
+            exit 1
+          fi
+          if [[ ! "$MODULE" =~ ^[a-z0-9][a-z0-9._-]*$ ]]; then
+            echo "::error::Module must start with a lowercase letter or digit and contain only lowercase letters, digits, dots, underscores or hyphens"
+            exit 1
+          fi
+          ECR_IMAGE="$ECR_REPOSITORY_PREFIX/$MODULE"
+          if [[ "$ECR_IMAGE" != "$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/"* \
+              || ! "$ECR_IMAGE" =~ ^[0-9]{12}\.dkr\.ecr\.[a-z0-9-]+\.amazonaws\.com/[a-z0-9][a-z0-9._/-]*$ ]]; then
+            echo "::error::ECR_IMAGE must be an untagged image in the configured AWS account and region"
+            exit 1
+          fi
+
+          if [[ "$REQUESTED_REPOSITORY" != "$SOURCE_REPOSITORY" ]]; then
+            echo "::error::The requested repository does not match the configured build target"
+            exit 1
+          fi
+          if [[ ! "$SOURCE_SHA" =~ ^[a-f0-9]{40}$ ]]; then
+            echo "::error::A full lowercase commit SHA is required"
+            exit 1
+          fi
+          if [[ ! "$IMAGE_TAG" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::An existing SemVer tag is required"
+            exit 1
+          fi
+          printf 'ECR_IMAGE=%s\n' "$ECR_IMAGE" >> "$GITHUB_ENV"
+
+      - name: Get source repository token
+        uses: actions/create-github-app-token@v2
+        id: source_token
+        with:
+          app-id: ${{ vars._GITHUB_APP_ID }}
+          private-key: ${{ secrets._GITHUB_APP_PEM }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ secrets.DOCKER_SOURCE_REPOSITORY }}
+          permission-contents: read
+
+      - name: Checkout source commit and tags
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/${{ secrets.DOCKER_SOURCE_REPOSITORY }}
+          ref: ${{ inputs.sha }}
+          token: ${{ steps.source_token.outputs.token }}
+          fetch-depth: 0
+          persist-credentials: false
+          path: source
+
+      - name: Verify source tag
+        working-directory: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$(git rev-parse HEAD)" != "$SOURCE_SHA" ]]; then
+            echo "::error::Checkout does not match the requested commit"
+            exit 1
+          fi
+          if [[ "$(git rev-parse "refs/tags/$IMAGE_TAG^{commit}")" != "$SOURCE_SHA" ]]; then
+            echo "::error::The version tag does not point to the requested commit"
+            exit 1
+          fi
+          if [[ ! -f Dockerfile ]]; then
+            echo "::error::Dockerfile not found at the repository root"
+            exit 1
+          fi
+
+      - name: Configure ECR credentials
+        uses: aws-actions/configure-aws-credentials@v6.3.0
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+          allowed-account-ids: ${{ secrets.AWS_ACCOUNT_ID }}
+          mask-aws-account-id: true
+
+      - name: Log in to ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and publish ECR version
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: source
+          platforms: linux/arm64,linux/amd64
+          push: true
+          tags: ${{ env.ECR_IMAGE }}:${{ env.IMAGE_TAG }}
+          # Keep a plain multi-platform index, like the Jib images.
+          provenance: false
+          cache-from: type=gha,scope=${{ inputs.module }}
+          cache-to: type=gha,mode=max,scope=${{ inputs.module }}
+
+      - name: Summarize image
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "$DIGEST" =~ ^sha256:[a-f0-9]{64}$ ]]; then
+            echo "::error::Docker build did not produce a valid image digest"
+            exit 1
+          fi
+          # Markdown backticks are literal code spans.
+          # shellcheck disable=SC2016
+          printf '### Container image\n\n- Module: `%s`\n- ECR image: `%s:%s`\n- Commit: `%s`\n- ECR digest: `%s`\n' \
+            "$MODULE" "$ECR_IMAGE" "$IMAGE_TAG" "$SOURCE_SHA" "$DIGEST" >> "$GITHUB_STEP_SUMMARY"
