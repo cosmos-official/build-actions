@@ -5,6 +5,10 @@ run-name: "Seller Admin Web Image Build: ${{ inputs.tag }} #${{ github.run_numbe
 # a multi-platform (linux/arm64, linux/amd64) image to ECR as
 # ECR_REPOSITORY_PREFIX/seller-admin-web:<tag>.
 #
+# No QEMU: the Dockerfile runs its build stage on the build platform only
+# (FROM --platform=$BUILDPLATFORM) and the per-platform nginx stage only copies
+# files. A RUN step in a per-platform stage would need QEMU again.
+#
 # Repository secrets: ECR_REPOSITORY_PREFIX (registry and namespace, without
 # module, tag or digest), AWS_ACCOUNT_ID, AWS_ACCESS_KEY_ID,
 # AWS_SECRET_ACCESS_KEY, _GITHUB_APP_PEM. Repository variable: _GITHUB_APP_ID.
@@ -119,9 +123,6 @@ jobs:
 
       - name: Log in to ECR
         uses: aws-actions/amazon-ecr-login@v2
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
