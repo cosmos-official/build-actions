@@ -1,25 +1,17 @@
-name: Docker Image Build
-run-name: "Docker Image Build: ${{ inputs.module }} ${{ inputs.tag }} #${{ github.run_number }}"
+name: Seller Admin Web Image Build
+run-name: "Seller Admin Web Image Build: ${{ inputs.tag }} #${{ github.run_number }}"
 
-# Builds the Dockerfile at the root of the source repository and pushes a
-# multi-platform (linux/arm64, linux/amd64) image to ECR.
+# Builds the root Dockerfile of cosmos-official/vingle-seller-admin-web and pushes
+# a multi-platform (linux/arm64, linux/amd64) image to ECR as
+# ECR_REPOSITORY_PREFIX/seller-admin-web:<tag>.
 #
-# Repository secrets: DOCKER_SOURCE_REPOSITORY (name without owner),
-# ECR_REPOSITORY_PREFIX (registry and namespace, without module, tag or digest),
-# AWS_ACCOUNT_ID, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, _GITHUB_APP_PEM.
-# Repository variable: _GITHUB_APP_ID.
+# Repository secrets: ECR_REPOSITORY_PREFIX (registry and namespace, without
+# module, tag or digest), AWS_ACCOUNT_ID, AWS_ACCESS_KEY_ID,
+# AWS_SECRET_ACCESS_KEY, _GITHUB_APP_PEM. Repository variable: _GITHUB_APP_ID.
 
 on:
   workflow_dispatch:
     inputs:
-      repository:
-        description: Repository to build (must match the configured secret)
-        required: true
-        type: string
-      module:
-        description: Image name under the ECR namespace
-        required: true
-        type: string
       sha:
         description: Full commit SHA to build
         required: true
@@ -33,7 +25,8 @@ permissions:
   contents: read
 
 env:
-  MODULE: ${{ inputs.module }}
+  SOURCE_REPOSITORY: vingle-seller-admin-web
+  MODULE: seller-admin-web
   SOURCE_SHA: ${{ inputs.sha }}
   IMAGE_TAG: ${{ inputs.tag }}
   AWS_REGION: ap-northeast-2
@@ -45,43 +38,26 @@ jobs:
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    env:
-      SOURCE_REPOSITORY: ${{ secrets.DOCKER_SOURCE_REPOSITORY }}
     steps:
       - name: Validate build inputs
-        env:
-          REQUESTED_REPOSITORY: ${{ inputs.repository }}
         shell: bash
         run: |
           set -euo pipefail
 
-          for SECRET_NAME in SOURCE_REPOSITORY AWS_ACCOUNT_ID ECR_REPOSITORY_PREFIX; do
+          for SECRET_NAME in AWS_ACCOUNT_ID ECR_REPOSITORY_PREFIX; do
             if [[ -z "${!SECRET_NAME}" ]]; then
               echo "::error::Missing required secret: $SECRET_NAME"
               exit 1
             fi
           done
-          if [[ ! "$SOURCE_REPOSITORY" =~ ^[A-Za-z0-9_.-]+$ ]]; then
-            echo "::error::DOCKER_SOURCE_REPOSITORY must be a repository name without an owner"
-            exit 1
-          fi
           if [[ ! "$AWS_ACCOUNT_ID" =~ ^[0-9]{12}$ ]]; then
             echo "::error::AWS_ACCOUNT_ID must contain exactly 12 digits"
-            exit 1
-          fi
-          if [[ ! "$MODULE" =~ ^[a-z0-9][a-z0-9._-]*$ ]]; then
-            echo "::error::Module must start with a lowercase letter or digit and contain only lowercase letters, digits, dots, underscores or hyphens"
             exit 1
           fi
           ECR_IMAGE="$ECR_REPOSITORY_PREFIX/$MODULE"
           if [[ "$ECR_IMAGE" != "$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/"* \
               || ! "$ECR_IMAGE" =~ ^[0-9]{12}\.dkr\.ecr\.[a-z0-9-]+\.amazonaws\.com/[a-z0-9][a-z0-9._/-]*$ ]]; then
             echo "::error::ECR_IMAGE must be an untagged image in the configured AWS account and region"
-            exit 1
-          fi
-
-          if [[ "$REQUESTED_REPOSITORY" != "$SOURCE_REPOSITORY" ]]; then
-            echo "::error::The requested repository does not match the configured build target"
             exit 1
           fi
           if [[ ! "$SOURCE_SHA" =~ ^[a-f0-9]{40}$ ]]; then
@@ -101,13 +77,13 @@ jobs:
           app-id: ${{ vars._GITHUB_APP_ID }}
           private-key: ${{ secrets._GITHUB_APP_PEM }}
           owner: ${{ github.repository_owner }}
-          repositories: ${{ secrets.DOCKER_SOURCE_REPOSITORY }}
+          repositories: ${{ env.SOURCE_REPOSITORY }}
           permission-contents: read
 
       - name: Checkout source commit and tags
         uses: actions/checkout@v4
         with:
-          repository: ${{ github.repository_owner }}/${{ secrets.DOCKER_SOURCE_REPOSITORY }}
+          repository: ${{ github.repository_owner }}/${{ env.SOURCE_REPOSITORY }}
           ref: ${{ inputs.sha }}
           token: ${{ steps.source_token.outputs.token }}
           fetch-depth: 0
@@ -160,8 +136,8 @@ jobs:
           tags: ${{ env.ECR_IMAGE }}:${{ env.IMAGE_TAG }}
           # Keep a plain multi-platform index, like the Jib images.
           provenance: false
-          cache-from: type=gha,scope=${{ inputs.module }}
-          cache-to: type=gha,mode=max,scope=${{ inputs.module }}
+          cache-from: type=gha,scope=seller-admin-web
+          cache-to: type=gha,mode=max,scope=seller-admin-web
 
       - name: Summarize image
         env:
